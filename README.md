@@ -75,7 +75,7 @@ Some sequence data, experimental Rg values, and CALVADOS residue parameters orig
 
 * Dignon et al., *PLoS Computational Biology*, 2018 ([HPS](https://doi.org/10.1371/journal.pcbi.1005941))
 
-* Tesei et al., *PNAS*, 2021 ([CALVADOS]((https://doi.org/10.1073/pnas.2111696118)))
+* Tesei et al., *PNAS*, 2021 ([CALVADOS](https://doi.org/10.1073/pnas.2111696118))
 
 * Additional references listed in the manuscript
 
