@@ -1,0 +1,172 @@
+import sys, os
+import hoomd
+import hoomd.md
+import itertools
+import pandas as pd
+import numpy as np
+import mdtraj as md
+from hoomd import azplugins
+from argparse import ArgumentParser
+
+def hps_desolvation(r, rmax, rmin, rb, rw, varb, varw, lam, sigma, eh, eb, ew):
+	lj_potential = 4 * eh * ((sigma / r)**12 - (sigma / r)**6)
+	lj_potential_diff = 24 * eh / r * (2 * (sigma / r)**12 - (sigma / r)**6)
+	if r <= 2**(1.0 / 6.0) * sigma:
+		V = lj_potential + (1 - lam) * eh\
+          + eb * np.exp(-(r-rb)**2 / varb)\
+          - ew * np.exp(-(r-rw)**2 / varw)
+		F = lj_potential_diff\
+          + eb * 2 * (r-rb) / varb * np.exp(-(r-rb)**2 / varb)\
+          - ew * 2 * (r-rw) / varw * np.exp(-(r-rw)**2 / varw)
+	else:
+		V = lam * lj_potential\
+          + eb * np.exp(-(r-rb)**2 / varb)\
+          - ew * np.exp(-(r-rw)**2 / varw)
+		F = lam * lj_potential_diff\
+          + eb * 2 * (r-rb) / varb * np.exp(-(r-rb)**2 / varb)\
+          - ew * 2 * (r-rw) / varw * np.exp(-(r-rw)**2 / varw)
+	return (V, F)
+
+def genParams(r, prot):
+    RT = 8.3145 * prot.temp * 1e-3
+    fepsw = lambda T : 5321/T+233.76-0.9297*T+0.1417*1e-2*T*T-0.8292*1e-6*T**3
+    epsw = fepsw(prot.temp)
+    lB = 1.6021766**2/(4*np.pi*8.854188*epsw)*6.022*1000/RT
+    # Calculate the inverse of the Debye length
+    yukawa_kappa = np.sqrt(8*np.pi*lB*prot.ionic*6.022/10)
+    fasta = prot.fasta
+    
+    # Set the charge on HIS based on the pH of the protein solution? Not needed if pH=7.4
+    r.loc['H','q'] = 1. / ( 1 + 10**(prot.pH-6) )
+    r.loc['X'] = r.loc[fasta[0]]
+    r.loc['X','q'] = r.loc[fasta[0],'q'] + 1.
+    r.loc['X','MW'] = r.loc[fasta[0],'MW'] + 2.
+    fasta[0] = 'X'
+    r.loc['Z'] = r.loc[fasta[-1]]
+    r.loc['Z','q'] = r.loc[fasta[-1],'q'] - 1.
+    r.loc['Z','MW'] = r.loc[fasta[-1],'MW'] + 16.
+    fasta[-1] = 'Z'
+    # Calculate the prefactor for the Yukawa potential
+    qq = pd.DataFrame(r.q.values*r.q.values.reshape(-1,1),index=r.q.index,columns=r.q.index)
+    yukawa_eps = qq*lB*RT
+    types = list(np.unique(fasta))
+    pairs = np.array(list(itertools.combinations_with_replacement(types,2)))
+    return yukawa_kappa, yukawa_eps, types, pairs, fasta, r
+
+def centerDCD(residues, prot, folder):
+    top = md.Topology()
+    chain = top.add_chain()
+    for resname in prot.fasta:
+        residue = top.add_residue(residues.loc[resname,'three'], chain)
+        top.add_atom(residues.loc[resname,'three'], element=md.element.carbon, residue=residue)
+    for i in range(len(prot.fasta)-1):
+        top.add_bond(top.atom(i),top.atom(i+1))
+    traj = md.load(f'{folder}.gsd', f'{folder}.dcd')[100:]
+    traj.top = top
+    traj = traj.image_molecules(inplace=False, anchor_molecules=[set(traj.top.chain(0).atoms)], make_whole=True)
+    traj.center_coordinates()
+    traj.xyz += traj.unitcell_lengths[0,0]/2
+    print('Number of frames: {:d}'.format(traj.n_frames))
+    traj.save_dcd(f'{folder}_center.dcd')
+    traj[0].save_pdb(f'{folder}.pdb')
+
+def run_single_chain_simulation(snapshot, prot, pairs, residues, folder):
+
+    hoomd.init.read_snapshot(snapshot)
+
+    hb = hoomd.md.bond.harmonic()
+    hb.bond_coeff.set('polymer', k=8033.0, r0=0.38)
+
+    nl = hoomd.md.nlist.cell()
+
+    varb, varw = 0.005, 0.005
+    nb = hoomd.md.pair.table(width=1000, nlist=nl)
+    yukawa = hoomd.md.pair.yukawa(r_cut=4.0, nlist=nl)
+    for a, b in pairs:
+        lam = lambdamap.loc[a, b]
+        sigma = sigmamap.loc[a, b]
+        rm = 2**(1. / 6.) * sigma
+        rb, rw = rm + .15, rm + .3
+        e_h = lj_eps * args.alpha_e
+        e_b = e_h * args.alpha_b
+        e_w = e_h * args.alpha_w
+        nb.pair_coeff.set(a, b, func=hps_desolvation, rmin=0.1, rmax=2.4,
+                        coeff=dict(rb=rb, rw=rw, varb=varb, varw=varw,
+                        lam=lam, sigma=sigma, eh=e_h, eb=e_b, ew=e_w))
+        yukawa.pair_coeff.set(a, b, epsilon=yukawa_eps.loc[a,b], kappa=yukawa_kappa, r_cut=4.)
+    
+    yukawa.set_params(mode='shift')
+    nl.reset_exclusions(exclusions = ['bond'])
+
+    integrator_mode = hoomd.md.integrate.mode_standard(dt=0.005)
+    integrator = hoomd.md.integrate.langevin(group=hoomd.group.all(), kT=RT, seed=np.random.randint(1, 2**31))
+
+    for a in types:
+        integrator.set_gamma(a, residues.loc[a].MW/100)
+
+    hoomd.run(10000)
+
+    integrator.disable()
+
+    integrator_mode = hoomd.md.integrate.mode_standard(dt=0.01)
+    integrator = hoomd.md.integrate.langevin(group=hoomd.group.all(), kT=RT, seed=np.random.randint(1, 2**31))
+
+    for a in types:
+        integrator.set_gamma(a, residues.loc[a].MW/100)
+
+    hoomd.dump.gsd(folder+'.gsd', period=N_save, group=hoomd.group.all(), truncate=True)
+    hoomd.dump.dcd(folder+'.dcd', period=N_save, group=hoomd.group.all(), overwrite=True)
+
+    hoomd.run(N_steps)
+    centerDCD(residues, prot, folder)
+
+parser = ArgumentParser()
+parser.add_argument('--name',nargs='?',const='', type=str)
+parser.add_argument('--alpha_b',nargs='?',const='', type=float)
+parser.add_argument('--alpha_w',nargs='?',const='', type=float)
+parser.add_argument('--alpha_e',nargs='?',const='', type=float)
+parser.add_argument('--replica',nargs='?',const='', type=int, default=10)
+args = parser.parse_args()
+
+# read residue and protein data
+residues = pd.read_csv('../data/residues.csv').set_index('one',drop=False)
+proteins = pd.read_pickle('../data/allproteins.pkl').astype(object)
+prot = proteins.loc[args.name]
+
+fileroot = f'{args.alpha_b}_{args.alpha_w}_{args.alpha_e}'
+folder = f'traj/{args.name}/CAL_{fileroot}/1chain'
+if not os.path.exists(folder):
+    os.makedirs(folder)
+
+cutoff = 2.4
+lj_eps = 4.184*.2
+RT = 8.3145*prot.temp*1e-3
+
+yukawa_kappa, yukawa_eps, types, pairs, fasta, residues = genParams(residues,prot)
+sigmamap = pd.DataFrame((residues.sigmas.values+residues.sigmas.values.reshape(-1,1))/2,
+                        index=residues.sigmas.index,columns=residues.sigmas.index)
+lambdamap = pd.DataFrame((residues.lambdas.values+residues.lambdas.values.reshape(-1,1))/2,
+                        index=residues.lambdas.index,columns=residues.lambdas.index)
+
+N_res = prot.N
+L = (N_res - 1) * .38 + 4
+N_save = 3000 if N_res < 100 else int(np.ceil(3e-4*N_res**2)*1000)
+N_steps = 1100*N_save
+
+hoomd.context.initialize("")
+
+snapshot = hoomd.data.make_snapshot(N=N_res,
+                                    box=hoomd.data.boxdim(Lx=L, Ly=L, Lz=L),
+                                    particle_types=types,
+                                    bond_types=['polymer'])
+
+snapshot.bonds.resize(N_res-1)
+snapshot.particles.position[:] = [[0,0,(i-N_res/2.)*.38] for i in range(N_res)]
+snapshot.particles.typeid[:] = [types.index(a) for a in fasta]
+snapshot.particles.mass[:] = [residues.loc[a].MW for a in fasta]
+snapshot.bonds.group[:] = [[i,i+1] for i in range(N_res-1)]
+snapshot.bonds.typeid[:] = [0] * (N_res-1)
+
+for irep in range(args.replica):
+    with hoomd.context.SimulationContext():
+        run_single_chain_simulation(snapshot, prot, pairs, residues, f'{folder}/replica_{irep}')
