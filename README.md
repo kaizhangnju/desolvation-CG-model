@@ -3,6 +3,12 @@
 This repository contains the simulation scripts, analysis utilities, and plotting routines used for the desolvation-parameterized coarse-grained modeling of intrinsically disordered proteins (IDPs).  
 It provides a complete workflow to (i) perform single-chain and slab simulations, (ii) analyze temperature-dependent conformational and phase behavior, and (iii) reproduce all publication-quality figures.
 
+## Associated publication
+
+If you use this code, please cite:
+
+Zhang K, Peng Z, Li W, Wang W (2026). *Role of desolvation on biomolecular liquid-liquid phase separation*. eLife 15:RP111124. [https://doi.org/10.7554/eLife.111124](https://doi.org/10.7554/eLife.111124).
+
 ## Overview
 
 This repository represents the code component of the desolvation project and includes:
